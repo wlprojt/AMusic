@@ -31,7 +31,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MusicTheme {
-                PlayerScreen(viewModel = viewModel)
+                MainScreen(viewModel = viewModel)
             }
         }
     }

@@ -15,7 +15,9 @@ import kotlinx.coroutines.launch
 data class PlayerUiState(
     val songs: List<Song> = emptyList(),
     val currentIndex: Int = -1,
-    val isPlaying: Boolean = false
+    val isPlaying: Boolean = false,
+    val currentPosition: Long = 0L,
+    val duration: Long = 0L,
 )
 
 class PlayerViewModel(application: Application) : AndroidViewModel(application) {
@@ -28,6 +30,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _uiState = MutableStateFlow(PlayerUiState())
     val uiState: StateFlow<PlayerUiState> = _uiState
+    private var pendingPlayIndex: Int? = null
 
     private val listener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -53,7 +56,25 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                     pendingMediaItems = null
                 }
 
+                pendingPlayIndex?.let { index ->
+                    if (index in 0 until mediaController.mediaItemCount) {
+                        mediaController.seekTo(index, 0L)
+                        mediaController.play()
+                    }
+                    pendingPlayIndex = null
+                }
+
                 syncState()
+
+                viewModelScope.launch {
+                    while (true) {
+                        syncState()
+                        kotlinx.coroutines.delay(500)
+                    }
+                }
+            },
+            onError = {
+                it.printStackTrace()
             }
         )
     }
@@ -61,53 +82,80 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     fun loadSongs() {
         if (_uiState.value.songs.isNotEmpty()) return
 
-        viewModelScope.launch(Dispatchers.IO) {
-            val songs = repository.getAllSongs()
+        viewModelScope.launch {
+            try {
+                val songs = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    repository.getAllSongs()
+                }
 
-            val mediaItems = songs.map { song ->
-                MediaItem.Builder()
-                    .setUri(song.uri)
-                    .setMediaId(song.id.toString())
-                    .setMediaMetadata(
-                        MediaMetadata.Builder()
-                            .setTitle(song.title)
-                            .setArtist(song.artist)
-                            .build()
-                    )
-                    .build()
+                val mediaItems = songs.map { song ->
+                    MediaItem.Builder()
+                        .setUri(song.uri)
+                        .setMediaId(song.id.toString())
+                        .setMediaMetadata(
+                            MediaMetadata.Builder()
+                                .setTitle(song.title)
+                                .setArtist(song.artist)
+                                .build()
+                        )
+                        .build()
+                }
+
+                _uiState.value = _uiState.value.copy(
+                    songs = songs,
+                    currentIndex = if (songs.isNotEmpty()) 0 else -1
+                )
+
+                val mediaController = controller
+                if (mediaController != null) {
+                    mediaController.setMediaItems(mediaItems)
+                    mediaController.prepare()
+
+                    pendingPlayIndex?.let { index ->
+                        if (index in songs.indices) {
+                            mediaController.seekTo(index, 0L)
+                            mediaController.play()
+                        }
+                        pendingPlayIndex = null
+                    }
+                } else {
+                    pendingMediaItems = mediaItems
+                }
+
+                syncState()
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
-
-            _uiState.value = _uiState.value.copy(
-                songs = songs,
-                currentIndex = if (songs.isNotEmpty()) 0 else -1
-            )
-
-            val mediaController = controller
-            if (mediaController != null) {
-                mediaController.setMediaItems(mediaItems)
-                mediaController.prepare()
-            } else {
-                pendingMediaItems = mediaItems
-            }
-
-            syncState()
         }
     }
 
     fun playSong(song: Song) {
         val index = _uiState.value.songs.indexOfFirst { it.id == song.id }
-        if (index != -1) {
-            controller?.let {
-                if (it.mediaItemCount == 0 && pendingMediaItems != null) {
-                    it.setMediaItems(pendingMediaItems!!)
-                    it.prepare()
+        if (index == -1) return
+
+        val mediaController = controller
+
+        if (mediaController != null) {
+            if (mediaController.mediaItemCount == 0) {
+                pendingMediaItems?.let { items ->
+                    mediaController.setMediaItems(items)
+                    mediaController.prepare()
                     pendingMediaItems = null
                 }
-                it.seekTo(index, 0)
-                it.play()
             }
-            syncState()
+
+            if (mediaController.mediaItemCount > 0) {
+                mediaController.seekTo(index, 0L)
+                mediaController.play()
+            } else {
+                pendingPlayIndex = index
+            }
+        } else {
+            pendingPlayIndex = index
         }
+
+        _uiState.value = _uiState.value.copy(currentIndex = index)
+        syncState()
     }
 
     fun togglePlayPause() {
@@ -143,10 +191,17 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun syncState() {
         val c = controller
+
         _uiState.value = _uiState.value.copy(
             currentIndex = c?.currentMediaItemIndex ?: _uiState.value.currentIndex,
-            isPlaying = c?.isPlaying ?: false
+            isPlaying = c?.isPlaying ?: false,
+            currentPosition = c?.currentPosition ?: 0L,
+            duration = if ((c?.duration ?: 0L) > 0) c?.duration ?: 0L else 0L
         )
+    }
+
+    fun seekTo(position: Long) {
+        controller?.seekTo(position)
     }
 
     override fun onCleared() {
